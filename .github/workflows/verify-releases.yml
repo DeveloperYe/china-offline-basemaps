@@ -35,29 +35,28 @@ jobs:
           node-version: 20
 
       - name: Verify all release assets
-        id: verify
         run: node scripts/verify-releases.mjs "${{ github.event.inputs.limit || '0' }}"
 
       - name: Open issue on failure
         if: failure()
         env:
           GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           TITLE="城市底图包体检失败（$(date -u +%Y-%m-%d)）"
-          # 避免重复开 issue：同标题已存在就不再开
           EXISTS=$(gh issue list --state open --search "$TITLE in:title" --json number --jq 'length')
           if [ "$EXISTS" != "0" ]; then
             echo "已有未关闭的同类 issue，跳过创建"
             exit 0
           fi
-          gh issue create \
-            --title "$TITLE" \
-            --body "每周自动体检发现异常，详见本次运行日志：
-${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-常见原因与处理：
-- \`HTTP 404\`：该城市的 Release/资产被删除或被替换过 → 用 \`build-city-tiles.yml\` 按原 source 日期重切（注意源档案只留约 5 天，过期需换新日期并重新生成索引）
-- \`HTTP 403\`：仓库可能被转成私有 → 下载直链对未登录用户不可用
-- \`字节数不符\`：资产被同名覆盖 → 重新生成 \`tiles/cities-index.json\`（\`scripts/gen-city-index.mjs\`）
-" \
-            --label "" || true
+          {
+            echo "每周自动体检发现异常，详见本次运行日志："
+            echo "$RUN_URL"
+            echo ""
+            echo "常见原因与处理："
+            echo "- HTTP 404：该城市的 Release 或资产被删除/替换 → 用 build-city-tiles.yml 按原 source 日期重切"
+            echo "  （注意源档案只留约 5 天，过期需换新日期并重新生成索引）"
+            echo "- HTTP 403：仓库可能被转成私有，下载直链对未登录用户不可用"
+            echo "- 字节数不符：资产被同名覆盖 → 重新运行 scripts/gen-city-index.mjs 刷新索引"
+          } > /tmp/issue-body.md
+          gh issue create --title "$TITLE" --body-file /tmp/issue-body.md
