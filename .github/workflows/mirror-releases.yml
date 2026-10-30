@@ -1,0 +1,112 @@
+name: Mirror City Releases
+
+# 把另一个仓库里已切好的城市底图包「镜像」到本仓库。
+#
+# 为什么需要：GitHub 没有跨仓库移动 Release 资产的 API，只能重新发布。
+# 但不需要经过本机——runner 之间传是 GitHub 内网速度，11.6GB 也很快。
+#
+# 用法（370 个城市超过单次矩阵上限 256，需分片）：
+#   第 1 片：offset=0   limit=200
+#   第 2 片：offset=200 limit=200
+#
+# 幂等：标签固定为 city-<adcode>-<source>，重跑会覆盖同名资产。
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_repo:
+        description: '来源仓库（owner/name）'
+        required: true
+        default: 'DeveloperYe/sport-health-app'
+      source:
+        description: '切包源日期（也用于拼标签）'
+        required: true
+        default: '20261029'
+      offset:
+        description: '起始偏移（分片用）'
+        required: false
+        default: '0'
+      limit:
+        description: '本片数量（矩阵上限 256）'
+        required: false
+        default: '200'
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      total: ${{ steps.gen.outputs.total }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: gen
+        run: |
+          node -e '
+            const fs = require("fs");
+            const { cities } = JSON.parse(fs.readFileSync("tiles/cities.json", "utf8"));
+            const offset = parseInt(process.env.OFFSET || "0", 10);
+            const limit = parseInt(process.env.LIMIT || "200", 10);
+            const list = cities.slice(offset, offset + limit);
+            const include = list.map((c) => ({ adcode: c.adcode, name: c.name }));
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, "matrix=" + JSON.stringify({ include }) + "\n");
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, "total=" + include.length + "\n");
+            console.log("本片镜像 " + include.length + " 个（offset=" + offset + "）");
+          '
+        env:
+          OFFSET: ${{ github.event.inputs.offset }}
+          LIMIT: ${{ github.event.inputs.limit }}
+
+  mirror:
+    needs: prepare
+    if: needs.prepare.outputs.total != '0'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 16
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    name: ${{ matrix.name }} (${{ matrix.adcode }})
+    timeout-minutes: 30
+    steps:
+      - name: Fetch pack from source repo
+        run: |
+          SRC="https://github.com/${{ github.event.inputs.from_repo }}/releases/download/city-${{ matrix.adcode }}-${{ github.event.inputs.source }}/${{ matrix.adcode }}.pmtiles"
+          OUT="${{ matrix.adcode }}.pmtiles"
+          ok=0
+          for i in $(seq 1 6); do
+            echo "=== attempt $i / 6 ==="
+            if curl -fL --retry 3 --retry-delay 3 --max-time 900 -o "$OUT" "$SRC"; then ok=1; break; fi
+            sleep 8
+          done
+          if [ "$ok" != "1" ]; then echo "::error::下载失败 $SRC"; exit 1; fi
+          ls -lh "$OUT"
+          echo "size=$(stat -c%s "$OUT")" >> $GITHUB_OUTPUT
+          echo "sha=$(sha256sum "$OUT" | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+        id: fetch
+
+      - name: Verify archive
+        run: |
+          # 轻量校验：PMTiles 魔数 + 非空，避免把截断文件发布出去
+          OUT="${{ matrix.adcode }}.pmtiles"
+          SIZE=$(stat -c%s "$OUT")
+          if [ "$SIZE" -lt 1000 ]; then echo "::error::产物太小（$SIZE 字节），疑似错误页"; exit 1; fi
+          head -c 7 "$OUT" | grep -q 'PMTiles' || { echo "::error::不是 PMTiles 文件"; exit 1; }
+          echo "魔数 OK，$SIZE 字节"
+
+      - name: Publish into this repo
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: city-${{ matrix.adcode }}-${{ github.event.inputs.source }}
+          name: 城市底图 ${{ matrix.name }}（${{ matrix.adcode }}）
+          prerelease: true
+          body: |
+            离线矢量瓦片包（Protomaps / ODbL，© OpenStreetMap contributors）
+
+            - 城市：${{ matrix.name }}（adcode ${{ matrix.adcode }}）
+            - source: `${{ github.event.inputs.source }}`
+            - 字节数：${{ steps.fetch.outputs.size }}
+            - sha256：`${{ steps.fetch.outputs.sha }}`
+            - 镜像自：`${{ github.event.inputs.from_repo }}`
+          files: ${{ matrix.adcode }}.pmtiles
